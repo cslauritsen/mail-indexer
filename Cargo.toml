@@ -1,0 +1,13 @@
+[package]
+name = "mail-indexer"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+anyhow = "1"
+mail-parser = "0.9"
+rusqlite = { version = "0.32", features = ["bundled"] }
+sqlite-vec = "0.1"
+serde_json = "1"
+sha2 = "0.10"
+ureq = { version = "2", features = ["json"] }
