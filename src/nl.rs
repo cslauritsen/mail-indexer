@@ -21,6 +21,7 @@ pub struct Interpreted {
     pub sender: Option<String>,
 }
 
+#[tracing::instrument(skip_all, fields(model, text_len = text.chars().count()))]
 pub fn interpret(api_key: &str, model: &str, text: &str, today: &str) -> Result<Interpreted> {
     let text: String = text.chars().take(MAX_INPUT_CHARS).collect();
     let system = format!(

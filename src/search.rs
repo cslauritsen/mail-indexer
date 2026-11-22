@@ -83,6 +83,7 @@ fn date_to_ts(conn: &Connection, s: &str) -> Result<i64> {
     .ok_or_else(|| anyhow!("invalid date '{s}', use YYYY-MM-DD"))
 }
 
+#[tracing::instrument(skip_all, fields(query_len = query.chars().count(), limit))]
 pub fn search(
     conn: &Connection,
     cfg: &EmbedConfig,
@@ -124,7 +125,7 @@ pub fn search(
         for (n, r) in rows.enumerate() {
             let (id, dist) = r?;
             if debug && n < 30 {
-                eprintln!("vec #{n} chunk {id} dist {dist:.4}");
+                tracing::debug!(rank = n, chunk = id, dist, "vector hit");
             }
             if dist <= max_dist {
                 vec_ids.push(id);
@@ -201,6 +202,7 @@ pub fn search(
             break;
         }
     }
+    tracing::debug!(vector = vec_ids.len(), text = fts_ids.len(), hits = hits.len(), "search done");
     Ok(hits)
 }
 

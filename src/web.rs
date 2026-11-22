@@ -106,7 +106,7 @@ pub(crate) fn serve(cfg: Config) -> Result<()> {
         crate::check_fingerprint(&conn, &cfg.embed)?;
     }
     if wc.anthropic_key.is_none() {
-        eprintln!("ANTHROPIC_API_KEY is not set: natural-language interpretation is disabled");
+        tracing::warn!("ANTHROPIC_API_KEY is not set: natural-language interpretation is disabled");
     }
     let listen = wc.listen.clone();
     let base_url = wc.base_url.clone();
@@ -118,7 +118,7 @@ pub(crate) fn serve(cfg: Config) -> Result<()> {
     let server = tiny_http::Server::http(listen.as_str())
         .map_err(|e| anyhow!("cannot listen on {listen}: {e}"))?;
     let server = Arc::new(server);
-    eprintln!("listening on http://{listen} (public URL {base_url})");
+    tracing::info!(%listen, %base_url, "listening");
 
     let mut handles = Vec::new();
     for _ in 0..WORKERS {
@@ -127,9 +127,13 @@ pub(crate) fn serve(cfg: Config) -> Result<()> {
         handles.push(std::thread::spawn(move || {
             for request in server.incoming_requests() {
                 // A panic in one request must not kill the worker.
-                let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     handle(&state, request)
-                }));
+                }))
+                .is_err()
+                {
+                    tracing::error!("panic while handling a request");
+                }
             }
         }));
     }
@@ -264,6 +268,14 @@ fn handle(st: &AppState, request: tiny_http::Request) {
     let params: Vec<(String, String)> = form_urlencoded::parse(query.as_bytes())
         .map(|(k, v)| (k.into_owned(), v.into_owned()))
         .collect();
+    // The query string is left out on purpose: it holds the user's search text.
+    let span = tracing::info_span!(
+        "http.request",
+        http.method = %request.method(),
+        http.path = path,
+        http.status_code = tracing::field::Empty,
+    );
+    let _entered = span.enter();
     let sid = cookie.as_deref().and_then(|c| cookie_get(c, COOKIE_NAME));
     let user = sid.as_deref().and_then(|s| st.auth.session_email(s));
 
@@ -276,6 +288,12 @@ fn handle(st: &AppState, request: tiny_http::Request) {
         (true, _, p) if p.starts_with("/m/") => page_message(st, user.as_deref(), &p[3..]),
         _ => error_page(404, user.as_deref(), "Page introuvable."),
     };
+    span.record("http.status_code", reply.status);
+    if path == "/healthz" {
+        tracing::debug!(status = reply.status, "request");
+    } else {
+        tracing::info!(status = reply.status, "request");
+    }
     send(request, reply);
 }
 
@@ -413,7 +431,7 @@ fn page_login(st: &AppState) -> Reply {
     match st.auth.login_url() {
         Ok(url) => Reply::redirect(&url),
         Err(e) => {
-            eprintln!("login failed: {e:#}");
+            tracing::error!("login failed: {e:#}");
             error_page(503, None, "Connexion momentanément impossible.")
         }
     }
@@ -430,7 +448,7 @@ fn page_callback(st: &AppState, params: &[(String, String)]) -> Reply {
     }
     match st.auth.finish_login(code, state) {
         Ok((sid, email)) => {
-            eprintln!("signed in: {email}");
+            tracing::info!(%email, "signed in");
             let secure = if st.wc.secure_cookie { "; Secure" } else { "" };
             Reply::redirect("/").with_header(
                 "Set-Cookie",
@@ -441,7 +459,7 @@ fn page_callback(st: &AppState, params: &[(String, String)]) -> Reply {
         }
         Err(e) => {
             // Details stay in the log; the browser only learns that access was refused.
-            eprintln!("sign-in refused: {e:#}");
+            tracing::warn!("sign-in refused: {e:#}");
             error_page(403, None, "Accès refusé.")
         }
     }
@@ -484,7 +502,7 @@ fn page_home(st: &AppState, user: Option<&str>, params: &[(String, String)]) -> 
                 content.push_str(&render_results(&hits));
             }
             Err(e) => {
-                eprintln!("search failed: {e:#}");
+                tracing::error!("search failed: {e:#}");
                 content.push_str(
                     "<p class=\"err\">La recherche a échoué. Voir le journal du serveur.</p>",
                 );
@@ -533,7 +551,7 @@ fn run_search(
                     note = Some(describe(&text, &filters));
                 }
                 Err(e) => {
-                    eprintln!("Claude interpretation failed: {e:#}");
+                    tracing::warn!("Claude interpretation failed: {e:#}");
                     note = Some("Claude est indisponible : recherche directe.".to_string());
                 }
             }
@@ -565,14 +583,14 @@ fn page_message(st: &AppState, user: Option<&str>, id: &str) -> Reply {
     let conn = match crate::open_conn(&st.cfg.db) {
         Ok(c) => c,
         Err(e) => {
-            eprintln!("cannot open the database: {e:#}");
+            tracing::error!("cannot open the database: {e:#}");
             return error_page(500, Some(user), "Base de données inaccessible.");
         }
     };
     let view = match crate::lookup_message(&conn, &st.cfg.maildir, id) {
         Ok(v) => v,
         Err(e) => {
-            eprintln!("message lookup failed: {e:#}");
+            tracing::error!("message lookup failed: {e:#}");
             return error_page(404, Some(user), "Courriel introuvable.");
         }
     };

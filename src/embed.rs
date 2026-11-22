@@ -32,6 +32,7 @@ impl EmbedConfig {
 }
 
 /// Embeds the given texts. The result has one vector per input, in the same order.
+#[tracing::instrument(skip_all, fields(provider = %cfg.provider, model = %cfg.model, inputs = inputs.len()))]
 pub fn embed(cfg: &EmbedConfig, inputs: &[String], kind: Kind) -> Result<Vec<Vec<f32>>> {
     if inputs.is_empty() {
         return Ok(Vec::new());
@@ -99,7 +100,7 @@ fn post_json(url: &str, bearer: Option<&str>, body: &Value) -> Result<Value> {
                 let text = resp.into_string().unwrap_or_default();
                 if (code == 429 || code >= 500) && attempt < 8 {
                     let wait = retry_after.unwrap_or_else(|| (2u64 << attempt.min(5)).min(60));
-                    eprintln!("embedding API returned {code}, retrying in {wait}s");
+                    tracing::warn!(code, attempt, wait_s = wait, "embedding API error, retrying");
                     std::thread::sleep(Duration::from_secs(wait));
                     continue;
                 }

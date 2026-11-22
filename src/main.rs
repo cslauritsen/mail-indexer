@@ -24,6 +24,7 @@ mod auth;
 mod embed;
 mod nl;
 mod search;
+mod telemetry;
 mod web;
 
 use anyhow::{anyhow, bail, Context, Result};
@@ -146,8 +147,12 @@ fn scan(root: &Path, skip: &[String]) -> Result<Vec<Found>> {
     let mut out = Vec::new();
     for (folder, dir) in dirs {
         for sub in ["cur", "new"] {
-            let Ok(rd) = fs::read_dir(dir.join(sub)) else {
-                continue;
+            let rd = match fs::read_dir(dir.join(sub)) {
+                Ok(rd) => rd,
+                Err(e) => {
+                    tracing::warn!(folder = %folder, sub, "cannot read directory: {e}");
+                    continue;
+                }
             };
             for f in rd.flatten() {
                 let fname = f.file_name().to_string_lossy().to_string();
@@ -493,6 +498,7 @@ fn flush(conn: &mut Connection, cfg: &Config, batch: &mut Vec<Prepared>) -> Resu
     Ok(stored)
 }
 
+#[tracing::instrument(skip_all)]
 fn cmd_index(cfg: &Config) -> Result<()> {
     let mut conn = open_db(cfg)?;
     check_fingerprint(&conn, &cfg.embed)?;
@@ -531,12 +537,12 @@ fn cmd_index(cfg: &Config) -> Result<()> {
                         .context("embedding or storing failed; run 'index' again to resume")?;
                     pending_ids.clear();
                     pending_inputs = 0;
-                    eprintln!("indexed {added} messages so far");
+                    tracing::info!(added, "indexed messages so far");
                 }
             }
             Err(e) => {
                 failed += 1;
-                eprintln!("skipped {}: {e:#}", f.path.display());
+                tracing::warn!(path = %f.path.display(), "skipped message: {e:#}");
             }
         }
     }
@@ -591,6 +597,7 @@ fn cmd_reset(cfg: &Config) -> Result<()> {
 
 // ---------------------------------------------------------------- search and show
 
+#[tracing::instrument(skip_all)]
 fn cmd_search(cfg: &Config, query: &str, filters: &search::Filters, limit: usize) -> Result<()> {
     let conn = open_db(cfg)?;
     check_fingerprint(&conn, &cfg.embed)?;
@@ -692,6 +699,9 @@ fn main() -> Result<()> {
         return Ok(());
     };
 
+    let _ = dotenvy::dotenv().ok();
+    // Flushes pending traces when main returns.
+    let _telemetry = telemetry::init();
     let mut opts: HashMap<String, String> = HashMap::new();
     let mut pos: Vec<String> = Vec::new();
     let mut i = 1;

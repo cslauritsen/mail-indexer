@@ -75,6 +75,26 @@ Run `index` regularly (cron or a systemd timer); the web application only reads 
 Run `index` and `serve` as the same user: SQLite's write-ahead log needs write access to the
 database directory even for readers.
 
+### Logging and tracing
+
+Logs go to stderr (stdout is command output). Traces are exported over OTLP when configured.
+Everything is set from the environment:
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `RUST_LOG` | `info` | Log filter, e.g. `debug` or `mail_indexer=debug,warn` |
+| `LOG_FORMAT` | `text` | `json` for one JSON object per line |
+| `OTEL_EXPORTER_OTLP_ENDPOINT` | | OTLP/HTTP collector, e.g. `http://localhost:4318`. Setting it (or `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT`) turns trace export on |
+| `OTEL_SERVICE_NAME` | `mail-indexer` | Service name on the traces |
+| `OTEL_TRACES_SAMPLER`, `OTEL_TRACES_SAMPLER_ARG` | parent-based, always on | Sampling, e.g. `parentbased_traceidratio` and `0.1` |
+| `OTEL_EXPORTER_OTLP_HEADERS` | | Auth headers for a hosted collector |
+| `OTEL_TRACES_EXPORTER` | | `none` disables export even if an endpoint is set |
+
+Only OTLP over HTTP/protobuf is supported (not gRPC). Each web request is a span
+(`http.request`, with method, path and status; the query string is left out) containing the
+`search`, `embed` and `interpret` spans. Search text and mail content are never recorded,
+only lengths and counts. Spans are flushed when a command exits.
+
 ### Google setup
 
 1. In the Google Cloud console, create an OAuth client of type **Web application**.
