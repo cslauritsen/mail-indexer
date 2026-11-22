@@ -71,7 +71,24 @@ mail-indexer serve                      # listens on 127.0.0.1:8080
 | `ANTHROPIC_API_KEY` | | Enables the "understand the sentence with Claude" option |
 | `ANTHROPIC_MODEL` | `claude-haiku-5-5` | Model used to interpret questions |
 
-Run `index` regularly (cron or a systemd timer); the web application only reads the index.
+The web application only reads the index. `deploy/` has systemd units that keep it current:
+
+```
+sudo cp deploy/mail-indexer*.{service,path,timer} /etc/systemd/system/
+sudo chown -R csl /var/lib/mail-index
+sudo systemctl daemon-reload
+sudo systemctl enable --now mail-indexer.service mail-indexer-index.path mail-indexer-index.timer
+```
+
+`mail-indexer-index.path` runs `index` about 10 seconds after mail lands in `INBOX/new`; the timer
+runs it every 15 minutes to pick up moves, deletions and other folders. Both start the same
+service, and systemd never runs two copies at once. Add a `PathChanged=` line for each extra
+folder you want indexed quickly.
+
+`index` refuses to remove more than 20% of the indexed messages in one run (when at least 10
+would go): a renamed Maildir or lost permissions look like mass deletion. It exits with an
+error and removes nothing; check `MAILDIR`, or run `index --force` if the deletion is real.
+
 Run `index` and `serve` as the same user: SQLite's write-ahead log needs write access to the
 database directory even for readers.
 

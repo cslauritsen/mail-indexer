@@ -2,7 +2,7 @@
 //! a small web application on top of it.
 //!
 //! Commands:
-//!   mail-indexer index                      scan the Maildir, add/move/remove messages
+//!   mail-indexer index [--force]            scan the Maildir, add/move/remove messages
 //!   mail-indexer search "<text>" [filters]  hybrid (semantic + full-text) search
 //!   mail-indexer show <id-prefix>           print one message
 //!   mail-indexer serve                      web application with Google sign-in
@@ -40,6 +40,11 @@ use std::{env, fs, time::Duration};
 const SCHEMA: &str = include_str!("../schema.sql");
 const MAX_CHUNKS: usize = 8; // per message, to bound embedding cost
 const CHUNK_CHARS: usize = 1200;
+/// `index` refuses to forget more than this share of the index in one run (unless --force):
+/// a renamed Maildir or lost permissions look exactly like mass deletion.
+const MAX_REMOVE_PERCENT: usize = 20;
+/// Below this many removals the guard stays quiet, so small indexes are not blocked.
+const MIN_REMOVE_GUARD: usize = 10;
 
 struct Config {
     maildir: PathBuf,
@@ -498,8 +503,13 @@ fn flush(conn: &mut Connection, cfg: &Config, batch: &mut Vec<Prepared>) -> Resu
     Ok(stored)
 }
 
+/// True when removing `gone` of `total` indexed messages looks like a mistake, not housekeeping.
+fn removal_blocked(gone: usize, total: usize) -> bool {
+    gone >= MIN_REMOVE_GUARD && gone * 100 > total * MAX_REMOVE_PERCENT
+}
+
 #[tracing::instrument(skip_all)]
-fn cmd_index(cfg: &Config) -> Result<()> {
+fn cmd_index(cfg: &Config, force: bool) -> Result<()> {
     let mut conn = open_db(cfg)?;
     check_fingerprint(&conn, &cfg.embed)?;
     let found = scan(&cfg.maildir, &cfg.skip)?;
@@ -568,6 +578,22 @@ fn cmd_index(cfg: &Config) -> Result<()> {
         }
         v
     };
+    let total: usize = conn.query_row("SELECT COUNT(*) FROM messages", [], |r| r.get::<_, i64>(0))?
+        as usize;
+    if !force && removal_blocked(gone.len(), total) {
+        tracing::error!(
+            gone = gone.len(),
+            total,
+            "refusing to remove {} of {} indexed messages (more than {MAX_REMOVE_PERCENT}%)",
+            gone.len(),
+            total
+        );
+        bail!(
+            "{} of {total} indexed messages are no longer on disk (more than {MAX_REMOVE_PERCENT}%). \
+             Is MAILDIR correct and readable? Nothing was removed; run 'index --force' if this is intended",
+            gone.len()
+        );
+    }
     for id in &gone {
         let tx = conn.transaction()?;
         // Delete chunks explicitly so the trigger cleans FTS and vectors.
@@ -684,7 +710,7 @@ fn cmd_show(cfg: &Config, id_prefix: &str) -> Result<()> {
 
 fn usage() {
     eprintln!(
-        "usage:\n  mail-indexer index [--maildir DIR] [--db FILE] [--skip .Junk,.Trash]\n  \
+        "usage:\n  mail-indexer index [--force] [--maildir DIR] [--db FILE] [--skip .Junk,.Trash]\n  \
          mail-indexer search \"text\" [--from YYYY-MM-DD] [--to YYYY-MM-DD] [--sender TEXT] [--limit N]\n  \
          mail-indexer show <id-prefix> [--maildir DIR]\n  \
          mail-indexer serve [--maildir DIR] [--db FILE]\n  \
@@ -707,7 +733,7 @@ fn main() -> Result<()> {
     let mut i = 1;
     while i < args.len() {
         if let Some(k) = args[i].strip_prefix("--") {
-            if k == "yes" {
+            if k == "yes" || k == "force" {
                 opts.insert(k.to_string(), "1".to_string());
                 i += 1;
                 continue;
@@ -776,7 +802,7 @@ fn main() -> Result<()> {
     match cmd.as_str() {
         "index" => {
             need_maildir()?;
-            cmd_index(&cfg)
+            cmd_index(&cfg, opts.contains_key("force"))
         }
         "search" => {
             if pos.is_empty() {
@@ -822,6 +848,16 @@ fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn removal_guard_blocks_mass_deletion_only() {
+        assert!(!removal_blocked(0, 1000));
+        assert!(!removal_blocked(200, 1000)); // exactly 20%
+        assert!(removal_blocked(201, 1000));
+        assert!(removal_blocked(1000, 1000)); // everything gone
+        assert!(!removal_blocked(5, 10)); // small deletions never trip it
+        assert!(removal_blocked(10, 20));
+    }
 
     #[test]
     fn clean_body_drops_quotes_and_signature() {

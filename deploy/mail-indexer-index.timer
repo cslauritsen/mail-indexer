@@ -1,0 +1,10 @@
+[Unit]
+Description=mail-indexer: periodic index (catches moves, deletions and anything the path unit missed)
+
+[Timer]
+OnCalendar=*:0/15
+# Run once at boot if a run was missed while the machine was off.
+Persistent=true
+
+[Install]
+WantedBy=timers.target

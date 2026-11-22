@@ -1,0 +1,11 @@
+[Unit]
+Description=mail-indexer: index soon after new mail arrives
+
+[Path]
+# Dovecot delivers into new/. Only INBOX is watched; moves, deletions and other folders are
+# picked up by mail-indexer-index.timer. Add one PathChanged= line per extra folder, e.g.
+# PathChanged=/home/csl/Maildir/.Church/new
+PathChanged=/home/csl/Maildir/new
+
+[Install]
+WantedBy=multi-user.target

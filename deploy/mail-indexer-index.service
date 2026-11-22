@@ -1,0 +1,20 @@
+[Unit]
+Description=mail-indexer: update the index from the Maildir
+After=local-fs.target
+
+[Service]
+Type=oneshot
+EnvironmentFile=/etc/mail-indexer.env
+# Wait a little so a burst of incoming mail (or the path and timer firing together)
+# is handled by one run.
+ExecStartPre=/bin/sleep 10
+ExecStart=/usr/local/bin/mail-indexer index
+# Same user as the web application: SQLite's write-ahead log needs write access to the
+# database directory even for readers.
+User=csl
+Nice=10
+NoNewPrivileges=true
+ProtectSystem=strict
+ReadWritePaths=/var/lib/mail-index
+ReadOnlyPaths=/home/csl/Maildir
+PrivateTmp=true
