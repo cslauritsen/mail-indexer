@@ -2,3 +2,7 @@
 .env
 dist/
 deploy/ansible/inventory.ini
+index.log
+mail-index.db
+mail-index.db-shm
+mail-index.db-wal
