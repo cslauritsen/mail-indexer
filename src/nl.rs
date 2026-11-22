@@ -63,9 +63,26 @@ pub fn interpret(api_key: &str, model: &str, text: &str, today: &str) -> Result<
         Err(e) => return Err(anyhow::Error::new(e).context("Claude API request failed")),
     };
 
-    let reply = resp["content"][0]["text"]
-        .as_str()
-        .ok_or_else(|| anyhow!("no text in the Claude API response"))?;
+    // The reply may start with non-text blocks (e.g. thinking), so look for the text block.
+    let reply = resp["content"]
+        .as_array()
+        .and_then(|blocks| {
+            blocks
+                .iter()
+                .find(|b| b["type"] == "text")
+                .and_then(|b| b["text"].as_str())
+        })
+        .ok_or_else(|| {
+            let kinds: Vec<&str> = resp["content"]
+                .as_array()
+                .map(|a| a.iter().filter_map(|b| b["type"].as_str()).collect())
+                .unwrap_or_default();
+            anyhow!(
+                "no text in the Claude API response (stop_reason {}, content blocks {:?})",
+                resp["stop_reason"].as_str().unwrap_or("none"),
+                kinds
+            )
+        })?;
     parse_reply(reply, &text)
 }
 
