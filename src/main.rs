@@ -26,6 +26,8 @@ const SCHEMA: &str = include_str!("../schema.sql");
 const MAX_CHUNKS: usize = 8; // per message, to bound embedding cost
 const CHUNK_CHARS: usize = 1200;
 const KNN_K: usize = 100;
+/// Vector hits farther than this are dropped (override with MAX_DIST).
+const MAX_VEC_DIST: f64 = f64::INFINITY;
 const RRF_K: f64 = 60.0;
 
 struct Config {
@@ -491,18 +493,37 @@ fn cmd_index(cfg: &Config) -> Result<()> {
 
 // ---------------------------------------------------------------- search
 
-/// Turns free text into an FTS5 query: quoted words joined by OR.
-fn fts_query(q: &str) -> Option<String> {
-    let toks: Vec<String> = q
-        .split(|c: char| !c.is_alphanumeric())
-        .filter(|t| t.chars().count() >= 3)
-        .map(|t| format!("\"{t}\""))
-        .collect();
-    if toks.is_empty() {
-        None
-    } else {
-        Some(toks.join(" OR "))
+/// Quoted search words (3+ chars, deduplicated, at most 8).
+fn fts_terms(q: &str) -> Vec<String> {
+    let mut toks: Vec<String> = Vec::new();
+    for t in q.split(|c: char| !c.is_alphanumeric()) {
+        let t = t.to_lowercase();
+        if t.chars().count() >= 3 && toks.len() < 8 && !toks.contains(&t) {
+            toks.push(t);
+        }
     }
+    toks.into_iter().map(|t| format!("\"{t}\"")).collect()
+}
+
+/// FTS5 query matching any `k` of the terms: (a AND b) OR (a AND c) OR ...
+fn fts_any_k(terms: &[String], k: usize) -> String {
+    fn rec(terms: &[String], k: usize, cur: &mut Vec<String>, out: &mut Vec<String>) {
+        if cur.len() == k {
+            out.push(format!("({})", cur.join(" AND ")));
+            return;
+        }
+        for i in 0..terms.len() {
+            if terms.len() - i < k - cur.len() {
+                break;
+            }
+            cur.push(terms[i].clone());
+            rec(&terms[i + 1..], k, cur, out);
+            cur.pop();
+        }
+    }
+    let mut out = Vec::new();
+    rec(terms, k, &mut Vec::new(), &mut out);
+    out.join(" OR ")
 }
 
 fn date_to_ts(conn: &Connection, s: &str) -> Result<i64> {
@@ -530,20 +551,38 @@ fn cmd_search(
     // 1. Semantic ranking.
     let qvec = embed(cfg, &[query.to_string()])?.remove(0);
     let mut vec_ids: Vec<i64> = Vec::new();
+    let max_dist: f64 = std::env::var("MAX_DIST")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(MAX_VEC_DIST);
+    let debug = std::env::var("SEARCH_DEBUG").is_ok();
     {
         let sql = format!(
-            "SELECT rowid FROM chunk_vectors WHERE embedding MATCH ?1 AND k = {KNN_K} ORDER BY distance"
+            "SELECT rowid, distance FROM chunk_vectors WHERE embedding MATCH ?1 AND k = {KNN_K} ORDER BY distance"
         );
         let mut st = conn.prepare(&sql)?;
-        let rows = st.query_map(params![to_blob(&qvec)], |r| r.get::<_, i64>(0))?;
-        for r in rows {
-            vec_ids.push(r?);
+        let rows = st.query_map(params![to_blob(&qvec)], |r| {
+            Ok((r.get::<_, i64>(0)?, r.get::<_, f64>(1)?))
+        })?;
+        for (n, r) in rows.enumerate() {
+            let (id, dist) = r?;
+            if debug && n < 30 {
+                eprintln!("vec #{n} chunk {id} dist {dist:.4}");
+            }
+            if dist <= max_dist {
+                vec_ids.push(id);
+            }
         }
     }
 
     // 2. Full-text ranking.
     let mut fts_ids: Vec<i64> = Vec::new();
-    if let Some(q) = fts_query(query) {
+    // Prefer messages with every word; step down to "any 2 words" if none,
+    // but never to a single word for a multi-word query.
+    let terms = fts_terms(query);
+    let min_k = terms.len().min(2);
+    for k in (min_k..=terms.len()).rev() {
+        let q = fts_any_k(&terms, k);
         let mut st = conn.prepare(&format!(
             "SELECT rowid FROM chunks_fts WHERE chunks_fts MATCH ?1 \
              ORDER BY bm25(chunks_fts) LIMIT {KNN_K}"
@@ -551,6 +590,9 @@ fn cmd_search(
         let rows = st.query_map(params![q], |r| r.get::<_, i64>(0))?;
         for r in rows {
             fts_ids.push(r?);
+        }
+        if !fts_ids.is_empty() {
+            break;
         }
     }
 
