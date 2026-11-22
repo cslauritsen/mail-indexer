@@ -48,6 +48,12 @@ CREATE VIRTUAL TABLE IF NOT EXISTS chunk_vectors USING vec0(
     embedding float[{DIM}]
 );
 
+-- Small key/value store, e.g. which embedding model built the vectors.
+CREATE TABLE IF NOT EXISTS meta (
+    key   TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+);
+
 -- sqlite-vec has no foreign keys, so clean FTS and vectors here.
 CREATE TRIGGER IF NOT EXISTS trg_chunks_delete AFTER DELETE ON chunks
 BEGIN
