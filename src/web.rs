@@ -215,7 +215,7 @@ fn header_value(request: &tiny_http::Request, name: &str) -> Option<String> {
     request
         .headers()
         .iter()
-        .find(|h| h.field.equiv(name))
+        .find(|h| h.field.as_str().as_str().eq_ignore_ascii_case(name))
         .map(|h| h.value.to_string())
 }
 
