@@ -1,0 +1,19 @@
+[Unit]
+Description=mail-indexer web application
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+EnvironmentFile=/etc/mail-indexer.env
+ExecStart=/usr/local/bin/mail-indexer serve
+Restart=on-failure
+User=mailindex
+# The service only needs to read the Maildir and write its own database.
+NoNewPrivileges=true
+ProtectSystem=strict
+ReadWritePaths=/var/lib/mail-index
+ReadOnlyPaths=/var/mail
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
