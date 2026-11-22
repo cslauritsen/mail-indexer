@@ -1,0 +1,129 @@
+---
+# Deploys mail-indexer to a Linux server: binary, directories, systemd units.
+#
+#   cp deploy/ansible/inventory.example.ini deploy/ansible/inventory.ini   # then edit the host
+#   docker build --target artifact --output type=local,dest=./dist .
+#   ansible-playbook -i deploy/ansible/inventory.ini deploy/ansible/playbook.yml
+#
+# The first run installs a template /etc/mail-indexer.env and stops there. Fill in the
+# secrets, then run the playbook again to enable and start the services.
+- name: Deploy mail-indexer
+  hosts: mail
+  become: true
+  vars:
+    # The units in deploy/ hard-code this user and these paths; change both together.
+    app_user: csl
+    maildir: /home/csl/Maildir
+    data_dir: /var/lib/mail-index
+    bin_path: /usr/local/bin/mail-indexer
+    env_file: /etc/mail-indexer.env
+    local_binary: "{{ playbook_dir }}/../../dist/mail-indexer"
+    unit_files:
+      - mail-indexer.service
+      - mail-indexer-index.service
+      - mail-indexer-index.path
+      - mail-indexer-index.timer
+
+  pre_tasks:
+    - name: Check that the binary has been built locally
+      ansible.builtin.stat:
+        path: "{{ local_binary }}"
+      register: local_bin
+      delegate_to: localhost
+      become: false
+
+    - name: Fail with build instructions if it is missing
+      ansible.builtin.assert:
+        that: local_bin.stat.exists
+        fail_msg: >-
+          {{ local_binary }} not found. Build it first:
+          docker build --target artifact --output type=local,dest=./dist .
+
+    - name: Check that the Maildir exists
+      ansible.builtin.stat:
+        path: "{{ maildir }}"
+      register: maildir_stat
+
+    - name: Fail if the Maildir is missing
+      ansible.builtin.assert:
+        that: maildir_stat.stat.exists and maildir_stat.stat.isdir
+        fail_msg: "{{ maildir }} does not exist on the server."
+
+  tasks:
+    - name: Create the database directory
+      ansible.builtin.file:
+        path: "{{ data_dir }}"
+        state: directory
+        owner: "{{ app_user }}"
+        group: "{{ app_user }}"
+        mode: "0750"
+        # Also fixes ownership of a database copied in by hand (WAL needs write access).
+        recurse: true
+
+    - name: Install the binary
+      ansible.builtin.copy:
+        src: "{{ local_binary }}"
+        dest: "{{ bin_path }}"
+        owner: root
+        group: root
+        mode: "0755"
+      register: binary
+
+    - name: Install the settings file from the template, if there is none yet
+      ansible.builtin.copy:
+        src: "{{ playbook_dir }}/../../.env.example"
+        dest: "{{ env_file }}"
+        owner: root
+        group: root
+        mode: "0600"
+        force: false # never overwrite secrets that are already there
+      register: env_template
+
+    - name: Keep the settings file private
+      ansible.builtin.file:
+        path: "{{ env_file }}"
+        owner: root
+        group: root
+        mode: "0600"
+
+    - name: Install the systemd units
+      ansible.builtin.copy:
+        src: "{{ playbook_dir }}/../{{ item }}"
+        dest: "/etc/systemd/system/{{ item }}"
+        owner: root
+        group: root
+        mode: "0644"
+      loop: "{{ unit_files }}"
+      register: units
+
+    - name: Reload systemd when units changed
+      ansible.builtin.systemd:
+        daemon_reload: true
+      when: units.changed
+
+    - name: Stop here on the first run
+      ansible.builtin.debug:
+        msg: >-
+          Installed {{ env_file }} from the template. Edit it on the server (Voyage and Google
+          keys, BASE_URL, ALLOWED_EMAILS), then run this playbook again to start the services.
+      when: env_template.changed
+
+    - name: Enable and start the web application and indexing units
+      ansible.builtin.systemd:
+        name: "{{ item }}"
+        enabled: true
+        state: started
+      loop:
+        - mail-indexer.service
+        - mail-indexer-index.path
+        - mail-indexer-index.timer
+      when: not env_template.changed
+
+    - name: Restart the web application when the binary or its unit changed
+      ansible.builtin.systemd:
+        name: mail-indexer.service
+        state: restarted
+      when: >-
+        not env_template.changed and
+        (binary.changed or (units.results | selectattr('item', 'equalto', 'mail-indexer.service')
+        | selectattr('changed') | list | length > 0))

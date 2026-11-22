@@ -80,6 +80,11 @@ sudo systemctl daemon-reload
 sudo systemctl enable --now mail-indexer.service mail-indexer-index.path mail-indexer-index.timer
 ```
 
+Or let Ansible do it (see `deploy/ansible/playbook.yml`): build the binary into `./dist`, copy
+`deploy/ansible/inventory.example.ini` to `inventory.ini`, then run
+`ansible-playbook -i deploy/ansible/inventory.ini deploy/ansible/playbook.yml`. The first run
+installs a template `/etc/mail-indexer.env` and stops; fill in the secrets and run it again.
+
 `mail-indexer-index.path` runs `index` about 10 seconds after mail lands in `INBOX/new`; the timer
 runs it every 15 minutes to pick up moves, deletions and other folders. Both start the same
 service, and systemd never runs two copies at once. Add a `PathChanged=` line for each extra
