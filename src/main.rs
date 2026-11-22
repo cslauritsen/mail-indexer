@@ -1,41 +1,49 @@
-//! mail-indexer: index a Dovecot Maildir into SQLite (FTS5 + sqlite-vec) and search it.
+//! mail-indexer: index a Dovecot Maildir into SQLite (FTS5 + sqlite-vec), search it, and serve
+//! a small web application on top of it.
 //!
 //! Commands:
 //!   mail-indexer index                      scan the Maildir, add/move/remove messages
 //!   mail-indexer search "<text>" [filters]  hybrid (semantic + full-text) search
 //!   mail-indexer show <id-prefix>           print one message
+//!   mail-indexer serve                      web application with Google sign-in
+//!   mail-indexer reset --yes                forget everything (needed when changing embeddings)
 //!
 //! Settings (flag or environment variable):
-//!   --maildir / MAILDIR        root of the Maildir (required for index and show)
+//!   --maildir / MAILDIR        root of the Maildir (required for index, show and serve)
 //!   --db      / DB             SQLite file (default: mail-index.db)
 //!   --skip    / SKIP_FOLDERS   comma-separated folders to ignore, e.g. .Junk,.Trash
-//!   EMBED_URL   Ollama-style endpoint (default: http://localhost:11434/api/embed)
-//!   EMBED_MODEL embedding model name (default: bge-m3)
-//!   EMBED_DIM   embedding size (default: 1024); must match the model
+//!   EMBED_PROVIDER             voyage (default when VOYAGE_API_KEY is set) or ollama
+//!   VOYAGE_API_KEY             API key for Voyage AI (environment only)
+//!   EMBED_URL, EMBED_MODEL     defaults: Voyage API and voyage-4, or local Ollama and bge-m3
+//!   EMBED_DIM                  vector size (default 1024); must match the model
+//!   EMBED_BATCH                texts per embedding request (default 64)
 //! Search filters: --from YYYY-MM-DD  --to YYYY-MM-DD  --sender TEXT  --limit N
+//! Web settings are documented in the README (BASE_URL, GOOGLE_CLIENT_ID, ...).
+
+mod auth;
+mod embed;
+mod nl;
+mod search;
+mod web;
 
 use anyhow::{anyhow, bail, Context, Result};
+use embed::{EmbedConfig, Kind};
 use mail_parser::MessageParser;
 use rusqlite::{ffi::sqlite3_auto_extension, params, Connection, OptionalExtension};
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::Once;
 use std::{env, fs, time::Duration};
 
 const SCHEMA: &str = include_str!("../schema.sql");
 const MAX_CHUNKS: usize = 8; // per message, to bound embedding cost
 const CHUNK_CHARS: usize = 1200;
-const KNN_K: usize = 100;
-/// Vector hits farther than this are dropped (override with MAX_DIST).
-const MAX_VEC_DIST: f64 = f64::INFINITY;
-const RRF_K: f64 = 60.0;
 
 struct Config {
     maildir: PathBuf,
     db: PathBuf,
-    embed_url: String,
-    embed_model: String,
-    dim: usize,
+    embed: EmbedConfig,
     skip: Vec<String>,
 }
 
@@ -62,16 +70,61 @@ struct Parsed {
 
 // ---------------------------------------------------------------- database
 
-fn open_db(cfg: &Config) -> Result<Connection> {
+static VEC_INIT: Once = Once::new();
+
+/// Opens the database with sqlite-vec loaded. Does not touch the schema.
+fn open_conn(db: &Path) -> Result<Connection> {
     // Register sqlite-vec for every connection opened after this point.
-    unsafe {
+    VEC_INIT.call_once(|| unsafe {
         sqlite3_auto_extension(Some(std::mem::transmute(
             sqlite_vec::sqlite3_vec_init as *const (),
         )));
-    }
-    let conn = Connection::open(&cfg.db).context("cannot open database")?;
-    conn.execute_batch(&SCHEMA.replace("{DIM}", &cfg.dim.to_string()))?;
+    });
+    let conn = Connection::open(db).context("cannot open database")?;
+    conn.busy_timeout(Duration::from_secs(10))?;
+    conn.execute_batch("PRAGMA foreign_keys = ON;")?;
     Ok(conn)
+}
+
+/// Opens the database and makes sure the schema exists.
+fn open_db(cfg: &Config) -> Result<Connection> {
+    let conn = open_conn(&cfg.db)?;
+    conn.execute_batch(&SCHEMA.replace("{DIM}", &cfg.embed.dim.to_string()))?;
+    Ok(conn)
+}
+
+/// Refuses to mix vectors from different embedding models or sizes.
+fn check_fingerprint(conn: &Connection, cfg: &EmbedConfig) -> Result<()> {
+    let fp = cfg.fingerprint();
+    let stored: Option<String> = conn
+        .query_row(
+            "SELECT value FROM meta WHERE key = 'embed_fingerprint'",
+            [],
+            |r| r.get(0),
+        )
+        .optional()?;
+    match stored {
+        Some(s) if s == fp => Ok(()),
+        Some(s) => bail!(
+            "the index was built with embeddings '{s}' but the current settings are '{fp}'; \
+             run 'mail-indexer reset --yes' and then 'index' to rebuild it"
+        ),
+        None => {
+            let n: i64 = conn.query_row("SELECT COUNT(*) FROM messages", [], |r| r.get(0))?;
+            // Indexes created before this check always used the local bge-m3 model.
+            if n > 0 && !(cfg.provider == "ollama" && cfg.model == "bge-m3") {
+                bail!(
+                    "the existing index predates the embedding check and was built with ollama/bge-m3; \
+                     run 'mail-indexer reset --yes' and then 'index' to rebuild it with '{fp}'"
+                );
+            }
+            conn.execute(
+                "INSERT OR REPLACE INTO meta (key, value) VALUES ('embed_fingerprint', ?1)",
+                params![fp],
+            )?;
+            Ok(())
+        }
+    }
 }
 
 // ---------------------------------------------------------------- Maildir scan
@@ -298,48 +351,27 @@ fn make_chunks(text: &str) -> Vec<String> {
     chunks
 }
 
-// ---------------------------------------------------------------- embeddings
-
-fn embed(cfg: &Config, inputs: &[String]) -> Result<Vec<Vec<f32>>> {
-    let resp: serde_json::Value = ureq::post(&cfg.embed_url)
-        .timeout(Duration::from_secs(300))
-        .send_json(serde_json::json!({ "model": cfg.embed_model, "input": inputs }))
-        .context("embedding request failed (is the embedding server running?)")?
-        .into_json()?;
-    let arr = resp["embeddings"]
-        .as_array()
-        .ok_or_else(|| anyhow!("no 'embeddings' field in the response"))?;
-    if arr.len() != inputs.len() {
-        bail!("got {} embeddings for {} inputs", arr.len(), inputs.len());
-    }
-    let mut out = Vec::new();
-    for v in arr {
-        let vec: Vec<f32> = v
-            .as_array()
-            .ok_or_else(|| anyhow!("bad embedding format"))?
-            .iter()
-            .map(|x| x.as_f64().unwrap_or(0.0) as f32)
-            .collect();
-        if vec.len() != cfg.dim {
-            bail!(
-                "embedding has {} dimensions, expected {} (check EMBED_DIM)",
-                vec.len(),
-                cfg.dim
-            );
-        }
-        out.push(vec);
-    }
-    Ok(out)
-}
-
-fn to_blob(v: &[f32]) -> Vec<u8> {
-    v.iter().flat_map(|f| f.to_le_bytes()).collect()
-}
-
 // ---------------------------------------------------------------- index
 
-/// Returns Ok(true) if a new message was added, Ok(false) if it was only moved.
-fn index_one(conn: &mut Connection, cfg: &Config, f: &Found) -> Result<bool> {
+/// A new message that has been parsed and chunked but not yet embedded or stored.
+struct Prepared {
+    parsed: Parsed,
+    folder: String,
+    name: String,
+    chunks: Vec<String>,
+    /// Texts to embed, one per chunk (headers + chunk).
+    inputs: Vec<String>,
+}
+
+enum Prep {
+    /// Already indexed; only its location was updated.
+    Moved,
+    /// Same message already waiting in the current batch.
+    Duplicate,
+    New(Box<Prepared>),
+}
+
+fn prepare(conn: &Connection, f: &Found, pending_ids: &HashSet<String>) -> Result<Prep> {
     let p = parse_file(&f.path)?;
 
     // Same message already indexed (moved to another folder, or a copy): update location.
@@ -356,7 +388,10 @@ fn index_one(conn: &mut Connection, cfg: &Config, f: &Found) -> Result<bool> {
             "UPDATE messages SET folder = ?1, maildir_name = ?2 WHERE id = ?3",
             params![f.folder, f.name, p.id],
         )?;
-        return Ok(false);
+        return Ok(Prep::Moved);
+    }
+    if pending_ids.contains(&p.id) {
+        return Ok(Prep::Duplicate);
     }
 
     let mut chunks = make_chunks(&clean_body(&p.body));
@@ -378,8 +413,17 @@ fn index_one(conn: &mut Connection, cfg: &Config, f: &Found) -> Result<bool> {
             )
         })
         .collect();
-    let vecs = embed(cfg, &inputs)?;
+    Ok(Prep::New(Box::new(Prepared {
+        parsed: p,
+        folder: f.folder.clone(),
+        name: f.name.clone(),
+        chunks,
+        inputs,
+    })))
+}
 
+fn store(conn: &mut Connection, prep: &Prepared, vecs: &[Vec<f32>]) -> Result<()> {
+    let p = &prep.parsed;
     let tx = conn.transaction()?;
     tx.execute(
         "INSERT INTO messages (id, message_id, in_reply_to, refs, folder, maildir_name, date_utc, \
@@ -390,8 +434,8 @@ fn index_one(conn: &mut Connection, cfg: &Config, f: &Found) -> Result<bool> {
             p.message_id,
             p.in_reply_to,
             p.refs,
-            f.folder,
-            f.name,
+            prep.folder,
+            prep.name,
             p.date,
             p.from_addr,
             p.from_name,
@@ -401,7 +445,7 @@ fn index_one(conn: &mut Connection, cfg: &Config, f: &Found) -> Result<bool> {
             p.has_attach as i64
         ],
     )?;
-    for (i, (c, v)) in chunks.iter().zip(vecs.iter()).enumerate() {
+    for (i, (c, v)) in prep.chunks.iter().zip(vecs.iter()).enumerate() {
         tx.execute(
             "INSERT INTO chunks (msg_id, chunk_no, text) VALUES (?1, ?2, ?3)",
             params![p.id, i as i64, c],
@@ -418,15 +462,40 @@ fn index_one(conn: &mut Connection, cfg: &Config, f: &Found) -> Result<bool> {
         )?;
         tx.execute(
             "INSERT INTO chunk_vectors (rowid, embedding) VALUES (?1, ?2)",
-            params![cid, to_blob(v)],
+            params![cid, embed::to_blob(v)],
         )?;
     }
     tx.commit()?;
-    Ok(true)
+    Ok(())
+}
+
+/// Embeds all waiting messages together (few requests, friendly to API rate limits),
+/// then stores them. Returns how many messages were stored.
+fn flush(conn: &mut Connection, cfg: &Config, batch: &mut Vec<Prepared>) -> Result<usize> {
+    if batch.is_empty() {
+        return Ok(0);
+    }
+    let all_inputs: Vec<String> = batch
+        .iter()
+        .flat_map(|p| p.inputs.iter().cloned())
+        .collect();
+    let mut vecs: Vec<Vec<f32>> = Vec::with_capacity(all_inputs.len());
+    for part in all_inputs.chunks(cfg.embed.batch.max(1)) {
+        vecs.extend(embed::embed(&cfg.embed, part, Kind::Document)?);
+    }
+    let mut it = vecs.into_iter();
+    let mut stored = 0;
+    for prep in batch.drain(..) {
+        let mine: Vec<Vec<f32>> = it.by_ref().take(prep.inputs.len()).collect();
+        store(conn, &prep, &mine)?;
+        stored += 1;
+    }
+    Ok(stored)
 }
 
 fn cmd_index(cfg: &Config) -> Result<()> {
     let mut conn = open_db(cfg)?;
+    check_fingerprint(&conn, &cfg.embed)?;
     let found = scan(&cfg.maildir, &cfg.skip)?;
     let on_disk: HashSet<(String, String)> = found
         .iter()
@@ -442,20 +511,37 @@ fn cmd_index(cfg: &Config) -> Result<()> {
         }
     }
 
-    let (mut added, mut moved, mut failed) = (0usize, 0usize, 0usize);
+    let (mut added, mut moved, mut dups, mut failed) = (0usize, 0usize, 0usize, 0usize);
+    let mut batch: Vec<Prepared> = Vec::new();
+    let mut pending_ids: HashSet<String> = HashSet::new();
+    let mut pending_inputs = 0usize;
     for f in found
         .iter()
         .filter(|f| !known.contains(&(f.folder.clone(), f.name.clone())))
     {
-        match index_one(&mut conn, cfg, f) {
-            Ok(true) => added += 1,
-            Ok(false) => moved += 1,
+        match prepare(&conn, f, &pending_ids) {
+            Ok(Prep::Moved) => moved += 1,
+            Ok(Prep::Duplicate) => dups += 1,
+            Ok(Prep::New(p)) => {
+                pending_ids.insert(p.parsed.id.clone());
+                pending_inputs += p.inputs.len();
+                batch.push(*p);
+                if pending_inputs >= cfg.embed.batch {
+                    added += flush(&mut conn, cfg, &mut batch)
+                        .context("embedding or storing failed; run 'index' again to resume")?;
+                    pending_ids.clear();
+                    pending_inputs = 0;
+                    eprintln!("indexed {added} messages so far");
+                }
+            }
             Err(e) => {
                 failed += 1;
                 eprintln!("skipped {}: {e:#}", f.path.display());
             }
         }
     }
+    added += flush(&mut conn, cfg, &mut batch)
+        .context("embedding or storing failed; run 'index' again to resume")?;
 
     // Remove messages whose file is gone (after moves were applied above).
     let gone: Vec<String> = {
@@ -485,182 +571,63 @@ fn cmd_index(cfg: &Config) -> Result<()> {
     }
 
     println!(
-        "added {added}, moved {moved}, removed {}, failed {failed}",
+        "added {added}, moved {moved}, duplicates {dups}, removed {}, failed {failed}",
         gone.len()
     );
     Ok(())
 }
 
-// ---------------------------------------------------------------- search
-
-/// Quoted search words (3+ chars, deduplicated, at most 8).
-fn fts_terms(q: &str) -> Vec<String> {
-    let mut toks: Vec<String> = Vec::new();
-    for t in q.split(|c: char| !c.is_alphanumeric()) {
-        let t = t.to_lowercase();
-        if t.chars().count() >= 3 && toks.len() < 8 && !toks.contains(&t) {
-            toks.push(t);
-        }
-    }
-    toks.into_iter().map(|t| format!("\"{t}\"")).collect()
+fn cmd_reset(cfg: &Config) -> Result<()> {
+    let mut conn = open_db(cfg)?;
+    let tx = conn.transaction()?;
+    // Chunks first, so the trigger empties the FTS and vector tables too.
+    tx.execute("DELETE FROM chunks", [])?;
+    tx.execute("DELETE FROM messages", [])?;
+    tx.execute("DELETE FROM meta WHERE key = 'embed_fingerprint'", [])?;
+    tx.commit()?;
+    println!("index emptied; run 'index' to rebuild it");
+    Ok(())
 }
 
-/// FTS5 query matching any `k` of the terms: (a AND b) OR (a AND c) OR ...
-fn fts_any_k(terms: &[String], k: usize) -> String {
-    fn rec(terms: &[String], k: usize, cur: &mut Vec<String>, out: &mut Vec<String>) {
-        if cur.len() == k {
-            out.push(format!("({})", cur.join(" AND ")));
-            return;
-        }
-        for i in 0..terms.len() {
-            if terms.len() - i < k - cur.len() {
-                break;
-            }
-            cur.push(terms[i].clone());
-            rec(&terms[i + 1..], k, cur, out);
-            cur.pop();
-        }
-    }
-    let mut out = Vec::new();
-    rec(terms, k, &mut Vec::new(), &mut out);
-    out.join(" OR ")
-}
+// ---------------------------------------------------------------- search and show
 
-fn date_to_ts(conn: &Connection, s: &str) -> Result<i64> {
-    conn.query_row(
-        "SELECT CAST(strftime('%s', ?1) AS INTEGER)",
-        params![s],
-        |r| r.get::<_, Option<i64>>(0),
-    )?
-    .ok_or_else(|| anyhow!("invalid date '{s}', use YYYY-MM-DD"))
-}
-
-fn cmd_search(
-    cfg: &Config,
-    query: &str,
-    from: Option<&str>,
-    to: Option<&str>,
-    sender: Option<&str>,
-    limit: usize,
-) -> Result<()> {
+fn cmd_search(cfg: &Config, query: &str, filters: &search::Filters, limit: usize) -> Result<()> {
     let conn = open_db(cfg)?;
-    let date_from = from.map(|s| date_to_ts(&conn, s)).transpose()?;
-    let date_to = to.map(|s| date_to_ts(&conn, s)).transpose()?;
-    let sender_pat = sender.map(|s| format!("%{s}%"));
-
-    // 1. Semantic ranking.
-    let qvec = embed(cfg, &[query.to_string()])?.remove(0);
-    let mut vec_ids: Vec<i64> = Vec::new();
-    let max_dist: f64 = std::env::var("MAX_DIST")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(MAX_VEC_DIST);
-    let debug = std::env::var("SEARCH_DEBUG").is_ok();
-    {
-        let sql = format!(
-            "SELECT rowid, distance FROM chunk_vectors WHERE embedding MATCH ?1 AND k = {KNN_K} ORDER BY distance"
-        );
-        let mut st = conn.prepare(&sql)?;
-        let rows = st.query_map(params![to_blob(&qvec)], |r| {
-            Ok((r.get::<_, i64>(0)?, r.get::<_, f64>(1)?))
-        })?;
-        for (n, r) in rows.enumerate() {
-            let (id, dist) = r?;
-            if debug && n < 30 {
-                eprintln!("vec #{n} chunk {id} dist {dist:.4}");
-            }
-            if dist <= max_dist {
-                vec_ids.push(id);
-            }
-        }
-    }
-
-    // 2. Full-text ranking.
-    let mut fts_ids: Vec<i64> = Vec::new();
-    // Prefer messages with every word; step down to "any 2 words" if none,
-    // but never to a single word for a multi-word query.
-    let terms = fts_terms(query);
-    let min_k = terms.len().min(2);
-    for k in (min_k..=terms.len()).rev() {
-        let q = fts_any_k(&terms, k);
-        let mut st = conn.prepare(&format!(
-            "SELECT rowid FROM chunks_fts WHERE chunks_fts MATCH ?1 \
-             ORDER BY bm25(chunks_fts) LIMIT {KNN_K}"
-        ))?;
-        let rows = st.query_map(params![q], |r| r.get::<_, i64>(0))?;
-        for r in rows {
-            fts_ids.push(r?);
-        }
-        if !fts_ids.is_empty() {
-            break;
-        }
-    }
-
-    // 3. Reciprocal Rank Fusion.
-    let mut score: HashMap<i64, f64> = HashMap::new();
-    for ids in [&vec_ids, &fts_ids] {
-        for (rank, id) in ids.iter().enumerate() {
-            *score.entry(*id).or_default() += 1.0 / (RRF_K + rank as f64 + 1.0);
-        }
-    }
-    let mut ranked: Vec<(i64, f64)> = score.into_iter().collect();
-    ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-
-    // 4. Apply filters, keep the best chunk per message.
-    let mut st = conn.prepare(
-        "SELECT m.id, m.subject, m.from_name, m.from_addr, datetime(m.date_utc, 'unixepoch'), \
-                m.folder, m.snippet \
-         FROM chunks c JOIN messages m ON m.id = c.msg_id \
-         WHERE c.id = ?1 \
-           AND (?2 IS NULL OR m.date_utc >= ?2) \
-           AND (?3 IS NULL OR m.date_utc <  ?3) \
-           AND (?4 IS NULL OR m.from_addr LIKE ?4 OR m.from_name LIKE ?4)",
-    )?;
-    let mut seen: HashSet<String> = HashSet::new();
-    let mut shown = 0usize;
-    for (chunk_id, _) in ranked {
-        let row = st
-            .query_row(params![chunk_id, date_from, date_to, sender_pat], |r| {
-                Ok((
-                    r.get::<_, String>(0)?,
-                    r.get::<_, Option<String>>(1)?,
-                    r.get::<_, Option<String>>(2)?,
-                    r.get::<_, Option<String>>(3)?,
-                    r.get::<_, String>(4)?,
-                    r.get::<_, String>(5)?,
-                    r.get::<_, Option<String>>(6)?,
-                ))
-            })
-            .optional()?;
-        let Some((id, subject, name, addr, date, folder, snippet)) = row else {
-            continue;
-        };
-        if !seen.insert(id.clone()) {
-            continue;
-        }
-        shown += 1;
-        println!(
-            "{shown}. [{}] {date}  {} <{}>  ({folder})",
-            &id[..id.len().min(12)],
-            name.unwrap_or_default(),
-            addr.unwrap_or_default()
-        );
-        println!("   {}", subject.unwrap_or_default());
-        println!("   {}", snippet.unwrap_or_default());
-        if shown >= limit {
-            break;
-        }
-    }
-    if shown == 0 {
+    check_fingerprint(&conn, &cfg.embed)?;
+    let hits = search::search(&conn, &cfg.embed, query, filters, limit)?;
+    if hits.is_empty() {
         println!("no results");
+    }
+    for (i, h) in hits.iter().enumerate() {
+        println!(
+            "{}. [{}] {}  {} <{}>  ({})",
+            i + 1,
+            &h.id[..h.id.len().min(12)],
+            h.date,
+            h.from_name,
+            h.from_addr,
+            h.folder
+        );
+        println!("   {}", h.subject);
+        println!("   {}", h.snippet);
     }
     Ok(())
 }
 
-// ---------------------------------------------------------------- show
+/// A message found by id, with its file parsed.
+struct MessageView {
+    path: PathBuf,
+    folder: String,
+    message_id: Option<String>,
+    date: String,
+    parsed: Parsed,
+}
 
-fn cmd_show(cfg: &Config, id_prefix: &str) -> Result<()> {
-    let conn = open_db(cfg)?;
+/// Finds a message by the start of its id (hex only) and reads it from the Maildir.
+fn lookup_message(conn: &Connection, maildir: &Path, id_prefix: &str) -> Result<MessageView> {
+    if id_prefix.len() < 4 || !id_prefix.chars().all(|c| c.is_ascii_hexdigit()) {
+        bail!("invalid message id");
+    }
     let row = conn
         .query_row(
             "SELECT folder, maildir_name, message_id, datetime(date_utc, 'unixepoch') \
@@ -677,16 +644,29 @@ fn cmd_show(cfg: &Config, id_prefix: &str) -> Result<()> {
         )
         .optional()?;
     let (folder, name, message_id, date) = row.ok_or_else(|| anyhow!("no message with that id"))?;
-    let path = locate(&cfg.maildir, &folder, &name)
+    let path = locate(maildir, &folder, &name)
         .ok_or_else(|| anyhow!("file not found on disk; run 'index' to refresh"))?;
-    let p = parse_file(&path)?;
-    println!("File:    {}", path.display());
-    println!("Folder:  {folder}");
-    println!("Date:    {date} UTC");
+    let parsed = parse_file(&path)?;
+    Ok(MessageView {
+        path,
+        folder,
+        message_id,
+        date,
+        parsed,
+    })
+}
+
+fn cmd_show(cfg: &Config, id_prefix: &str) -> Result<()> {
+    let conn = open_db(cfg)?;
+    let v = lookup_message(&conn, &cfg.maildir, id_prefix)?;
+    let p = &v.parsed;
+    println!("File:    {}", v.path.display());
+    println!("Folder:  {}", v.folder);
+    println!("Date:    {} UTC", v.date);
     println!("From:    {} <{}>", p.from_name, p.from_addr);
     println!("To:      {}", p.to);
     println!("Subject: {}", p.subject);
-    if let Some(m) = message_id {
+    if let Some(m) = &v.message_id {
         println!("Link:    mid:{m}");
     }
     println!("\n{}", p.body);
@@ -699,7 +679,9 @@ fn usage() {
     eprintln!(
         "usage:\n  mail-indexer index [--maildir DIR] [--db FILE] [--skip .Junk,.Trash]\n  \
          mail-indexer search \"text\" [--from YYYY-MM-DD] [--to YYYY-MM-DD] [--sender TEXT] [--limit N]\n  \
-         mail-indexer show <id-prefix> [--maildir DIR]"
+         mail-indexer show <id-prefix> [--maildir DIR]\n  \
+         mail-indexer serve [--maildir DIR] [--db FILE]\n  \
+         mail-indexer reset --yes [--db FILE]"
     );
 }
 
@@ -715,6 +697,11 @@ fn main() -> Result<()> {
     let mut i = 1;
     while i < args.len() {
         if let Some(k) = args[i].strip_prefix("--") {
+            if k == "yes" {
+                opts.insert(k.to_string(), "1".to_string());
+                i += 1;
+                continue;
+            }
             let v = args
                 .get(i + 1)
                 .cloned()
@@ -733,14 +720,36 @@ fn main() -> Result<()> {
             .or_else(|| env::var(var).ok())
             .unwrap_or_else(|| default.to_string())
     };
-    let cfg = Config {
-        maildir: PathBuf::from(get("maildir", "MAILDIR", "")),
-        db: PathBuf::from(get("db", "DB", "mail-index.db")),
-        embed_url: get("embed-url", "EMBED_URL", "http://localhost:11434/api/embed"),
-        embed_model: get("embed-model", "EMBED_MODEL", "bge-m3"),
+
+    // Secrets come from the environment only, never from flags.
+    let api_key = env::var("VOYAGE_API_KEY").unwrap_or_default();
+    let default_provider = if api_key.is_empty() {
+        "ollama"
+    } else {
+        "voyage"
+    };
+    let provider = get("embed-provider", "EMBED_PROVIDER", default_provider);
+    let (default_url, default_model) = match provider.as_str() {
+        "voyage" => ("https://api.voyageai.com/v1/embeddings", "voyage-4"),
+        "ollama" => ("http://localhost:11434/api/embed", "bge-m3"),
+        other => bail!("unknown EMBED_PROVIDER '{other}' (use voyage or ollama)"),
+    };
+    let embed_cfg = EmbedConfig {
+        url: get("embed-url", "EMBED_URL", default_url),
+        model: get("embed-model", "EMBED_MODEL", default_model),
         dim: get("embed-dim", "EMBED_DIM", "1024")
             .parse()
             .context("EMBED_DIM must be a number")?,
+        batch: get("embed-batch", "EMBED_BATCH", "64")
+            .parse()
+            .context("EMBED_BATCH must be a number")?,
+        provider,
+        api_key,
+    };
+    let cfg = Config {
+        maildir: PathBuf::from(get("maildir", "MAILDIR", "")),
+        db: PathBuf::from(get("db", "DB", "mail-index.db")),
+        embed: embed_cfg,
         skip: get("skip", "SKIP_FOLDERS", "")
             .split(',')
             .map(|s| s.trim().to_string())
@@ -769,14 +778,12 @@ fn main() -> Result<()> {
                 .transpose()
                 .context("--limit must be a number")?
                 .unwrap_or(10);
-            cmd_search(
-                &cfg,
-                &pos.join(" "),
-                opts.get("from").map(|s| s.as_str()),
-                opts.get("to").map(|s| s.as_str()),
-                opts.get("sender").map(|s| s.as_str()),
-                limit,
-            )
+            let filters = search::Filters {
+                from: opts.get("from").cloned(),
+                to: opts.get("to").cloned(),
+                sender: opts.get("sender").cloned(),
+            };
+            cmd_search(&cfg, &pos.join(" "), &filters, limit)
         }
         "show" => {
             need_maildir()?;
@@ -785,9 +792,43 @@ fn main() -> Result<()> {
                 .ok_or_else(|| anyhow!("usage: show <id-prefix>"))?;
             cmd_show(&cfg, id)
         }
+        "serve" => {
+            need_maildir()?;
+            web::serve(cfg)
+        }
+        "reset" => {
+            if !opts.contains_key("yes") {
+                bail!("reset deletes the whole index; add --yes to confirm");
+            }
+            cmd_reset(&cfg)
+        }
         _ => {
             usage();
             Ok(())
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn clean_body_drops_quotes_and_signature() {
+        let body = "Hello\n> quoted line\nBye\n-- \nChad";
+        assert_eq!(clean_body(body), "Hello\nBye");
+    }
+
+    #[test]
+    fn make_chunks_groups_paragraphs_and_caps_the_count() {
+        assert_eq!(make_chunks("one\n\ntwo"), vec!["one two".to_string()]);
+        let long = "word ".repeat(10_000);
+        assert!(make_chunks(&long).len() <= MAX_CHUNKS);
+        assert!(make_chunks("").is_empty());
+    }
+
+    #[test]
+    fn clean_ids_strips_angle_brackets() {
+        assert_eq!(clean_ids("<a@x>  <b@y>"), "a@x b@y");
     }
 }
